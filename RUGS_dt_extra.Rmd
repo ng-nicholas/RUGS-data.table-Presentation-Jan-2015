@@ -1,0 +1,179 @@
+---
+title: "data.table Versus dplyr - Benchmarking"
+author: "Nicholas Ng & Gaurav Chaturvedi for RUGS"
+date: "5 Jan 2016"
+output: 
+  html_document: 
+    fig_caption: yes
+    toc: yes
+---
+```{r globaloptions, echo=FALSE}
+knitr::opts_chunk$set(echo = F, results = "hide", cache = F)
+options(width = 110)
+```
+
+# Introduction
+As mentioned by Gaurav, one of the main advantages to using the `data.table` package is the speed at which it is able to perform all kinds of data wrangling operations.
+
+In this Rmarkdown document, we will present benchmarking of common operations, comparing the speed of `data.table` in performing those operations to that of `dplyr`.
+
+## Packages used
+The `suppressMessages` method was used to suppress the package loading messages.
+```{r packages, echo=TRUE}
+# The 2 main data manipulation packages to test:
+suppressMessages(library(dplyr))
+suppressMessages(library(data.table))
+
+# For date parsing and manipulation:
+suppressMessages(library(lubridate))
+
+# For benchmarking:
+suppressMessages(library(microbenchmark))
+```
+
+## Dataset used
+```{r databackground}
+data_raw <- fread("rugsdply.csv")
+```
+The dataset used in performing these benchmarking tests is obtained from a property rental website, recording interactions between interested users with rental property listings. There are `r format(nrow(data_raw), big.mark = ",")` observations and `r format(ncol(data_raw), big.mark = ",")` variables, a summary of which has been provided below:
+```{r datasummary, results='markup'}
+summary(data_raw)
+rm(data_raw)
+```
+
+# Benchmarking
+## Reading data
+We begin our benchmarking with data reading as the `data.table` package provides an internal method of reading data into a datatable object. The main purpose for providing such a method is to make the data parsing process as painless and quick as possible, as opposed to `dplyr`, which requires you to use the base read methods:
+```{r bm_read, echo=TRUE, results='markup'}
+# Using data.table's fread method
+microbenchmark(
+    datatable = (
+        dt_raw <- fread("rugsdply.csv", showProgress = F)
+    ),
+    dplyr = (
+        dplyr_raw <- tbl_df(read.csv("rugsdply.csv", stringsAsFactors = F))
+    ),
+    times = 50,
+    unit = "s"
+)
+```
+
+## Appending data
+A common scenario would be adding new data rows to an offline dataset that had been downloaded from the server/dbms previously. This is equivalent to a UNION operation in SQL:
+```{r bm_append, echo=TRUE, results='markup'}
+microbenchmark(
+    datatable = (
+        dt_append <- rbindlist(list(dt_raw, dt_raw))
+    ),
+    dplyr = (
+        dplyr_append <- rbind_list(dplyr_raw, dplyr_raw)
+    ),
+    times = 50,
+    unit = "s"
+)
+```
+
+## Joins
+`data.table` contains internal methods for joining tables in case you would need to join 2 datasets offline. It allows for fast joins since it uses the keys methods otherwise used for fast subsetting:
+```{r bm_join, echo=TRUE, results='markup'}
+# Obtaining a table of unique values for joining
+setkey(dt_raw, prop_id)
+df_uniq <- as.data.frame(unique(dt_raw[, .(prop_id, user_id)]))
+dt_uniq <- as.data.table(df_uniq)
+dplyr_uniq <- tbl_df(df_uniq)
+
+# Benchmarking left joins
+microbenchmark(
+    datatable = {
+        setkey(dt_raw, prop_id)
+        setkey(dt_uniq, prop_id)
+        dt_join <- dt_uniq[dt_raw]
+    },
+    dplyr = (
+        dplyr_join <- dplyr_raw %>%
+            left_join(dplyr_uniq, by = "prop_id")
+    ),
+    times = 50,
+    unit = "s"
+)
+```
+
+## Add/Remove/Modify Columns
+In this example, assuming that `property_size` is recorded in square feet, a particularly useful measure might be the rental cost per square feet, which would allow interested parties identify the properties that provide the most return per $ paid in rent.
+
+Additionally, since all file parsing methods would inevitably parse date columns as character strings, it would be useful to convert date columns into POSIXct type. Lubridate is used to quickly convert dates in both cases, and add a `contact_mthyr` column for easy aggregation later. Because the last operation is contingent on the `contact_date` column being converted into a POSIXct type, we will have to chain that operation:
+```{r bm_mutate, echo=TRUE, results='markup'}
+microbenchmark(
+    datatable = {
+        dt_mutate <- copy(dt_raw)
+        dt_mutate[, `:=`(
+            rent_persqft = rent / property_size,
+            contact_date = ymd(contact_date)
+        )
+        ][, contact_mthyr := format(contact_date, "%b-%Y")]
+    },
+    dplyr = (
+        dplyr_mutate <- dplyr_raw %>%
+            mutate(rent_persqft = rent / property_size, 
+                   contact_date = ymd(contact_date)) %>%
+            mutate(contact_mthyr = format(contact_date, "%b-%Y"))
+    ),
+    times = 50,
+    unit = "s"
+)
+```
+
+## Data aggregation
+Because data can be fairly granular when extracted from the server, it may be necessary aggregate it to a higher level. In this example, we may like to analyse the interactions regardless of property, user or inactive reasons by month in order to discover the average rent asked for per month:
+```{r bm_agg, echo=TRUE, results='markup'}
+microbenchmark(
+    datatable = (
+        dt_agg <- dt_mutate[, lapply(.SD, mean), by = .(contact_mthyr, city, type),
+                         .SDcols = c("property_size", "rent", "rent_persqft")]
+    ),
+    dplyr = (
+        dplyr_agg <- dplyr_mutate %>%
+            group_by(contact_mthyr, city, type) %>%
+            summarise(property_size = mean(property_size),
+                      rent = mean(rent),
+                      rent_persqft = mean(rent_persqft))
+    ),
+    times = 50,
+    unit = "s"
+)
+```
+
+## Table reshaping
+Sometimes your data may come in in a wide table, rather than a long one (i.e. a common example being dates as column headers). We would commonly use the `reshape2` package to melt and cast the tables, but with recent versions of `data.table`, these methods have been internalised in order to better work with the data structures.
+
+Here we will convert the tables into wide form on the `contact_date` column, then transform it back into long form (for rent values only). Additionally, we do not load the `reshape2` package as it will mask the similarly named functions in `data.table` - we instead use on-demand calls to the required methods in the `reshape2` package.
+```{r bm_reshape, echo=TRUE, results='markup'}
+# Benchmarking for casting
+microbenchmark(
+    datatable = (
+        dt_dcast <- dcast(dt_agg, city + type ~ contact_mthyr, value.var = "rent")
+    ),
+    dplyr = (
+        dplyr_dcast <- reshape2::dcast(dplyr_agg, city + type ~ contact_mthyr,
+                                       value.var = "rent")
+    ),
+    times = 50,
+    unit = "s"
+)
+# Benchmarking for melting
+microbenchmark(
+    datatable = (
+        dt_melt <- melt(dt_dcast, id.vars = c("city", "type"), 
+                        variable.name = c("contact_mthyr"), value.name = "rent",
+                        variable.factor = F)
+    ),
+    dplyr = (
+        dplyr_melt <- reshape2::melt(dt_dcast, id.vars = c("city", "type"), 
+                                      variable.name = c("contact_mthyr"),
+                                      value.name = "rent",
+                                      variable.factor = F)
+    ),
+    times = 50,
+    unit = "s"
+)
+```

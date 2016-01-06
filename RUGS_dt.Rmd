@@ -1,0 +1,250 @@
+---
+title: "RUGS"
+author: "Gaurav Chaturvedi"
+date: "12/31/2015"
+output: html_document
+---
+
+```{r globaloptions, echo=FALSE}
+knitr::opts_chunk$set(echo = F, results = "hide", cache = F)
+```
+
+# Introduction
+
+One of the main advantages to using the `data.table` package is the speed at which it is able to perform all kinds of data wrangling operations.
+
+In this Rmarkdown document, we will present benchmarking of common operations, comparing the speed of `data.table` in performing those operations to that of `dplyr`. We will also demonstrate the syntactical comparisons between the 2 packages. 
+
+## Packages used in this document
+
+The `suppressMessages` method was used to suppress the package loading messages.
+```{r packages, echo=TRUE}
+# The 2 main data manipulation packages to test:
+suppressMessages(library(dplyr))
+suppressMessages(library(data.table))
+
+# For date parsing and manipulation:
+suppressMessages(library(lubridate))
+
+# For benchmarking:
+suppressMessages(library(microbenchmark))
+
+```
+
+## About the Dataset 
+
+
+```{r echo = FALSE,  message = FALSE}
+c_df <- read.csv("rugsdply.csv")
+```
+
+The dataset used in performing these benchmarking tests is obtained from a property rental website, recording interactions between interested users with rental property listings. There are `r format(nrow(c_df), big.mark = ",")` observations and `r format(ncol(c_df), big.mark = ",")` variables, a summary of which has been provided below:
+
+```{r datasummary, results='markup'}
+summary(c_df)
+rm(c_df)
+```
+
+# Speed Test
+
+## Reading data
+
+We begin our benchmarking with data reading as the `data.table` package provides an internal method of reading data into a datatable object. The main purpose for providing such a method is to make the data parsing process as painless and quick as possible, as opposed to `dplyr`, which requires you to use the base read methods:
+
+```{r bm_read, echo=TRUE, results='markup'}
+# Using data.table's fread method
+microbenchmark(
+    datatable = (
+        dt_raw <- fread("rugsdply.csv", showProgress = F)
+    ),
+    dplyr = (
+        dplyr_raw <- tbl_df(read.csv("rugsdply.csv", stringsAsFactors = F))
+    ),
+    times = 5
+)
+```
+
+As you can see, reading the data using data table's fread function is much faster. Lets do another speed test with a dedupe data manipulation. We use the simpler system.time function this time. 
+
+## Eliminate duplicates (user_id, Property_id combinations); keep the first instance by request_date
+
+
+```{r echo = TRUE, results = 'markup'}
+
+# DPLYR
+system.time(cdedup_dplyr <- dplyr_raw %>% arrange(contact_date) %>% group_by (prop_id, user_id) %>% filter(1:n() == 1))
+
+# DATA TABLE
+
+system.time({setorderv(dt_raw, "contact_date")
+setkeyv(dt_raw, c("user_id", "prop_id"))
+cdedup_dt <- unique(dt_raw)})
+
+```
+
+Don't bother about the syntax right now. 
+
+In this cases speed difference is around 40-100x. Why is speed so critical? Think of adhoc analysis, dashboard, customer browsing properties on portal.
+
+Experts say that the speed difference between the 2 packages is in evidence with data sets >100k rows. 
+
+Having demonstrated the speed difference, we focus on the syntax of the 2 packages in the next part.We will refer to relative speeds where it is relevant. 
+
+# DPLYR vs DATA TABLE syntax 
+
+## Add/Remove/Modify Columns
+
+In this example, assuming that `property_size` is recorded in square feet, a particularly useful measure might be the rental cost per square feet, which would allow interested parties identify the properties that provide the most return per $ paid in rent.
+
+Additionally, since all file parsing methods would inevitably parse date columns as character strings, it would be useful to convert date columns into POSIXct type. Lubridate is used to quickly convert dates in both cases, and add a `contact_mthyr` column for easy aggregation later. Because the last operation is contingent on the `contact_date` column being converted into a POSIXct type, we 
+will have to chain that operation:
+
+```{r bm_mutate, echo=TRUE, results='markup'}
+
+         dt_mutate <- copy(cdedup_dt)
+         dt_mutate[, `:=`(
+             rent_persqft = rent / property_size,
+             contact_date = ymd(contact_date)
+         )
+         ][, contact_mthyr := format(contact_date, "%b-%Y")] # Chaining
+        
+         dplyr_mutate <- cdedup_dplyr
+         dplyr_mutate$rent_persqft <- dplyr_mutate$rent / dplyr_mutate$property_size
+         dplyr_mutate$contact_date <- as.Date(dplyr_mutate$contact_date, "%Y-%m-%d")
+         dplyr_mutate$contact_mthyr <- format(dplyr_mutate$contact_date, "%b-%Y")
+           
+#            dplyr_mutate <- cdedup_dplyr %>%
+#              mutate(contact_date = ymd(contact_date),
+#                     rent_persqft = rent / property_size) %>%
+#              mutate(contact_mthyr = format(contact_date, "%b-%Y"))
+   
+```
+
+Chaining refers to the practice of using consecutive [] operations one after the other. 
+
+':=' is creating a new column by reference (in the same dataset dt_mutate). 
+
+## Group Summarise - get the count and median(rent) of all contacts by city
+
+```{r echo = TRUE, results = 'markup'}
+# DPLYR 
+gs2_df <- cdedup_dplyr %>% group_by(city) %>% summarise(med_rent = round(median(rent),0), ccts = n())
+gs2_df
+
+# DATA TABLE
+gs2_dt <- cdedup_dt[, list(med_rent= round(median(rent),0), ccts = .N), by=city]
+gs2_dt
+
+```
+
+If you time the above 2 operations (mutate and summarise), you will notice that the speed difference between the 2 packages in these cases is not substantial. The reason is that the grouping and the operation is very simple. Let us try something more complex.
+
+## Find out mean rental by city for 2 buckets property size <= 500 and property size > 500
+
+```{r echo = TRUE, results='markup'}
+
+# DPLYR
+system.time (gs3_df <- cdedup_dplyr %>% mutate(props_bkt = ifelse(property_size <= 500, TRUE, FALSE))%>% group_by (city,props_bkt) %>% summarise(mean_rent = as.integer(mean(rent))))
+gs3_df
+
+# DATA TABLE
+system.time (gs3_dt <- cdedup_dt[, list(mean_rent = as.integer(mean(rent))), by=list(city,props_bkt = property_size <=500 )])
+gs3_dt
+
+gs3_dt <- cdedup_dt[, list(mean_rent = as.integer(mean(rent))), by=list(city,props_bkt = property_size <=500 )][order(mean_rent)]  # Chaining
+gs3_dt
+
+```
+
+The speed difference in this case is noticeable. Data table scales better as the number of groups increase. 
+
+Let us try some data aggregation now. 
+
+## Data Aggregation
+
+Because data can be fairly granular when extracted from the server, it may be necessary aggregate it to a higher level. In this example, we may like to analyse the interactions regardless of property, user or inactive reasons by month in order to discover the average rent asked for per month:
+
+```{r bm_agg, echo=TRUE, results='markup'}
+microbenchmark(
+    datatable = (
+        dt_agg <- dt_mutate[, lapply(.SD, mean), by = .(contact_mthyr, city, type),
+                         .SDcols = c("property_size", "rent", "rent_persqft")]
+    ),
+    dplyr = (
+        dplyr_agg <- dplyr_mutate %>%
+            group_by(contact_mthyr, city, type) %>%
+            summarise(property_size = mean(property_size),
+                      rent = mean(rent),
+                      rent_persqft = mean(rent_persqft))
+    ),
+    times = 5
+)
+```
+
+Notice the data table syntax using .SD and .SDCols. Data table is again quicker due to the complex grouping. 
+
+## Table Reshaping
+
+Sometimes your data may come in in a wide table, rather than a long one (i.e. a common example being dates as column headers). We would commonly use the `reshape2` package to melt and cast the tables, but with recent versions of `data.table`, these methods have been internalised in order to better work with the data structures.
+
+Here we will convert the tables into wide form on the `contact_date` column, then transform it back into long form (for rent values only). Additionally, we do not load the `reshape2` package as it will mask the similarly named functions in `data.table` - we instead use on-demand calls to the required methods in the `reshape2` package.
+
+```{r bm_reshape, echo=TRUE, results='markup'}
+# Benchmarking for casting
+microbenchmark(
+    datatable = (
+        dt_dcast <- dcast(dt_agg, city + type ~ contact_mthyr, value.var = "rent")
+    ),
+    dplyr = (
+        dplyr_dcast <- reshape2::dcast(dplyr_agg, city + type ~ contact_mthyr,
+                                       value.var = "rent")
+    ),
+    times = 5
+)
+# Benchmarking for melting
+microbenchmark(
+    datatable = (
+        dt_melt <- melt(dt_dcast, id.vars = c("city", "type"), 
+                        variable.name = c("contact_mthyr"), value.name = "rent",
+                        variable.factor = F)
+    ),
+    dplyr = (
+        dplyr_melt <- reshape2::melt(dt_dcast, id.vars = c("city", "type"), 
+                                      variable.name = c("contact_mthyr"),
+                                      value.name = "rent",
+                                      variable.factor = F)
+    ),
+    times = 5
+)
+```
+
+
+## Std Dev of rent amount for users with > 3 contacts and plot Histogram
+
+```{r echo = TRUE, results = 'markup'}
+
+# DPLYR
+system.time(gs4_df <- cdedup_dplyr %>% group_by(user_id)%>% mutate(cntcts = n()) %>% filter(cntcts >=3) %>% summarise(rent_sd = sd(rent)))
+hist(log10(gs4_df$rent_sd+1))
+
+# DATA TABLE
+system.time ( {
+  setkey(cdedup_dt, user_id) 
+  gs4_dt <- cdedup_dt[, cntcts := .N, by=user_id][cntcts >=3, list(rent_sd=sd(rent)), by=user_id] 
+  }
+  )
+
+hist(log10(gs4_dt$rent_sd+1))
+
+```
+
+In this case we again use Chaining as we want step1 to just add a new column with number of contacts (for userid) and then filter using that outcome followed by step2 where we group by userid.
+
+':=' is creating a new column by reference (in the same dataset). After this operation notice that even cdedup_dt has a new column called 'cntcts'. 
+
+'.N' is count of rows
+
+If you used list instead of .N in step1, that would create a summary table in the first step of the chain. We dont want that. 
+
+The outcome shows most users tolerate rental deviation of around $1,000. This will be useful if we wish to recommend properties to users who have some browsing history on the website. 
+
