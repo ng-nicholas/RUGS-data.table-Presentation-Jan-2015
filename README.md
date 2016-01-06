@@ -1,4 +1,5 @@
 # RUGS-data.table-Presentation-Jan-2015
+### *By Gaurav Chaturedi & Nicholas Ng for RUGS*
 Repo for material and powerpoint presentation used in RUGS meetup on 5 Jan 2015. These were the files used on a presentation on the data.table package.
 
 ## Guide to files:
